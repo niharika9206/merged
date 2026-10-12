@@ -1,0 +1,242 @@
+// ============================================================
+// STAGE 4 FIX: CORRECT SAMPLE POINT GENERATION
+// Fixes: scale=30 for sampling, roi passed explicitly,
+//        visualise computed images not assets
+// ============================================================
+
+Map.setOptions('SATELLITE');
+
+var roi = ee.Geometry.Rectangle([86.5, 26.3, 87.6, 27.0]);
+Map.centerObject(roi, 9);
+
+// ── SHARED SETUP (identical to previous script) ───────────────
+var glo30 = ee.ImageCollection('COPERNICUS/DEM/GLO30')
+  .filterBounds(roi).select('DEM').mosaic().clip(roi);
+var elevMask  = glo30.lt(200);
+var permWater = ee.Image('JRC/GSW1_4/GlobalSurfaceWater')
+  .select('seasonality').gte(10);
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+
+function normaliseAngle(image) {
+  var angle  = image.select('angle').unmask(30);
+  var cosObs = angle.multiply(Math.PI / 180).cos();
+  var cosRef = ee.Number(30 * Math.PI / 180).cos();
+  var cf     = cosObs.pow(2).divide(cosRef.multiply(cosRef));
+  var vh = ee.Image(10).pow(image.select('VH').divide(10))
+    .divide(cf).max(1e-10).log10().multiply(10).rename('VH_norm');
+  var vv = ee.Image(10).pow(image.select('VV').divide(10))
+    .divide(cf).max(1e-10).log10().multiply(10).rename('VV_norm');
+  return image.addBands(vh, null, true).addBands(vv, null, true)
+    .copyProperties(image, ['system:time_start']);
+}
+
+function leeFilter(image, band) {
+  var b  = image.select(band);
+  var li = ee.Image(10).pow(b.divide(10));
+  var m  = li.reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1.5));
+  var sm = li.pow(2).reduceNeighborhood(ee.Reducer.mean(), ee.Kernel.square(1.5));
+  var v  = sm.subtract(m.pow(2)).max(0);
+  var w  = v.subtract(m.pow(2).divide(4.9))
+             .divide(v.add(m.pow(2).divide(4.9)).max(1e-10)).max(0).min(1);
+  return m.add(w.multiply(li.subtract(m)))
+    .max(1e-10).log10().multiply(10).rename(band + '_lee');
+}
+
+function applyLee(image) {
+  return image
+    .addBands(leeFilter(image, 'VH_norm'), null, true)
+    .addBands(leeFilter(image, 'VV_norm'), null, true)
+    .copyProperties(image, ['system:time_start']);
+}
+
+var s1f = s1.map(normaliseAngle).map(applyLee);
+
+function otsuThreshold(changeImg, bandName, region) {
+  var neg = changeImg.updateMask(changeImg.lt(0));
+  var h   = ee.Dictionary(neg.reduceRegion({
+    reducer: ee.Reducer.histogram(200, 0.1),
+    geometry: region, scale: 30, maxPixels: 1e9, bestEffort: true
+  }).get(bandName));
+  var counts = ee.List(h.get('histogram'));
+  var means  = ee.List(h.get('bucketMeans'));
+  var size   = counts.size();
+  var total  = ee.Number(counts.reduce(ee.Reducer.sum()));
+  var wSum   = ee.Number(counts.zip(means).map(function(p) {
+    p = ee.List(p);
+    return ee.Number(p.get(0)).multiply(ee.Number(p.get(1)));
+  }).reduce(ee.Reducer.sum()));
+  var res = ee.List.sequence(0, size.subtract(2)).iterate(function(t, acc) {
+    acc = ee.Dictionary(acc); t = ee.Number(t);
+    var cb=ee.List(acc.get('cb')); var sb=ee.Number(acc.get('sb'));
+    var bB=ee.Number(acc.get('bB')); var bT=ee.Number(acc.get('bT'));
+    var cc=ee.Number(counts.get(t)); var cm=ee.Number(means.get(t));
+    var ncb=cb.add(cc); var nsb=sb.add(cc.multiply(cm));
+    var wA=ee.Number(ncb.reduce(ee.Reducer.sum()));
+    var muA=nsb.divide(wA); var wB=total.subtract(wA);
+    var muB=wSum.subtract(nsb).divide(wB);
+    var bcv=wA.multiply(wB).multiply(muA.subtract(muB).pow(2));
+    return ee.Dictionary({ cb:ncb, sb:nsb,
+      bB: ee.Number(ee.Algorithms.If(bcv.gt(bB), bcv, bB)),
+      bT: ee.Number(ee.Algorithms.If(bcv.gt(bB), cm, bT)) });
+  }, ee.Dictionary({cb:ee.List([]), sb:ee.Number(0),
+    bB:ee.Number(-1), bT:ee.Number(0)}));
+  return ee.Number(ee.Dictionary(res).get('bT'));
+}
+
+// ── FIX 1: roi passed explicitly into function ────────────────
+function makeFloodMask(preStart, preEnd, postStart, postEnd, region) {
+  var pre  = s1f.filterDate(preStart, preEnd).median().clip(region);
+  var post = s1f.filterDate(postStart, postEnd).median().clip(region);
+  var cVH  = post.select('VH_norm_lee')
+               .subtract(pre.select('VH_norm_lee')).rename('change_VH');
+  var cVV  = post.select('VV_norm_lee')
+               .subtract(pre.select('VV_norm_lee')).rename('change_VV');
+  var tVH  = otsuThreshold(cVH, 'change_VH', region);
+  var tVV  = otsuThreshold(cVV, 'change_VV', region);
+  var raw  = cVH.lt(tVH).or(cVV.lt(tVV)).rename('flood');
+  var masked = raw.multiply(permWater.not()).multiply(elevMask).rename('flood');
+  var conn   = masked.connectedPixelCount({maxSize:100, eightConnected:true});
+  return masked.updateMask(conn.gte(4)).unmask(0)
+    .multiply(elevMask).rename('flood').toInt();
+}
+
+// ── REBUILD MERGED INVENTORY ──────────────────────────────────
+print('Building flood masks for all 5 events...');
+
+var flood2017 = makeFloodMask('2017-03-01','2017-06-30','2017-08-05','2017-09-15', roi);
+var flood2019 = makeFloodMask('2019-03-01','2019-06-30','2019-08-01','2019-10-15', roi);
+var flood2021 = makeFloodMask('2021-01-01','2021-06-15','2021-07-01','2021-09-30', roi);
+var flood2022 = makeFloodMask('2022-01-01','2022-06-15','2022-08-01','2022-10-15', roi);
+var flood2024 = makeFloodMask('2024-01-01','2024-06-30','2024-09-15','2024-10-31', roi);
+
+var floodInventory = flood2017.max(flood2019).max(flood2021)
+  .max(flood2022).max(flood2024).rename('flood');
+
+var floodFrequency = flood2017.add(flood2019).add(flood2021)
+  .add(flood2022).add(flood2024).rename('frequency');
+
+// ── FIX 2: Visualise computed images directly (not assets) ────
+Map.addLayer(floodInventory.selfMask(),
+  {palette: ['FF00FF']}, 'Multi-year flood inventory (magenta)');
+Map.addLayer(floodFrequency,
+  {min:0, max:5, palette:['white','yellow','orange','red','800000']},
+  'Flood frequency (1=yellow → 5=dark red)');
+
+// Verify merged area
+var invArea = floodInventory.toFloat().multiply(ee.Image.pixelArea())
+  .reduceRegion({reducer: ee.Reducer.sum(), geometry: roi,
+                 scale: 100, maxPixels: 1e10, bestEffort: true});
+print('Total merged flood area (km²):',
+  ee.Number(invArea.get('flood')).divide(1e6).round());
+
+// Per-event area for verification
+var events = {
+  '2017': flood2017, '2019': flood2019, '2021': flood2021,
+  '2022': flood2022, '2024': flood2024
+};
+Object.keys(events).forEach(function(yr) {
+  var a = events[yr].toFloat().multiply(ee.Image.pixelArea())
+    .reduceRegion({reducer: ee.Reducer.sum(), geometry: roi,
+                   scale: 100, maxPixels: 1e10, bestEffort: true});
+  print(yr + ' area (km²):',
+    ee.Number(a.get('flood')).divide(1e6).round());
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// SAMPLE POINTS — FIX 3: scale=30 instead of scale=10
+//
+// WHY scale=30:
+// At scale=10 over an 8,509 km² ROI, GEE must consider
+// ~85 million pixels for sampling — hits memory limit
+// silently returns far fewer points than requested.
+// At scale=30 the grid has ~9.5 million pixels — manageable.
+// Sample point coordinates are still precise lat/lon.
+// Scale=30 matches the 30m sampling standard used in
+// Khan et al. (2026) for the same Kosi Megafan study area.
+// ══════════════════════════════════════════════════════════════
+
+var N = 6000;
+
+// Flood sample points
+var floodPoints = floodInventory
+  .updateMask(floodInventory.eq(1))
+  .sample({
+    region:    roi,
+    scale:     30,       // FIX: was 10, now 30
+    numPixels: N,
+    seed:      42,
+    geometries: true
+  })
+  .map(function(f){ return f.set('label', 1); });
+
+// Non-flood sample points
+// Sampled from flat Terai only — same constraint as flood pixels
+var nonFloodMask = floodInventory.eq(0)
+  .multiply(permWater.not())
+  .multiply(elevMask)
+  .selfMask();
+
+var nonFloodPoints = nonFloodMask
+  .sample({
+    region:    roi,
+    scale:     30,       // FIX: was 10, now 30
+    numPixels: N,
+    seed:      42,
+    geometries: true
+  })
+  .map(function(f){ return f.set('label', 0); });
+
+var allPoints = floodPoints.merge(nonFloodPoints);
+
+print('── SAMPLE POINT COUNTS ──');
+print('Flood points:', floodPoints.size());
+print('Non-flood points:', nonFloodPoints.size());
+print('Total:', allPoints.size());
+
+// Visualise points
+Map.addLayer(floodPoints,    {color: 'FF0000'}, 'Flood points (red)');
+Map.addLayer(nonFloodPoints, {color: '0000FF'}, 'Non-flood points (blue)');
+
+
+// ══════════════════════════════════════════════════════════════
+// EXPORTS
+// ══════════════════════════════════════════════════════════════
+
+Export.image.toDrive({
+  image: floodInventory, description: 'FloodInventory_Merged_2017_2024',
+  folder: 'FloodInventory_Koshi', fileNamePrefix: 'flood_inventory_merged',
+  region: roi, scale: 10, crs: 'EPSG:32645',
+  maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: floodFrequency, description: 'FloodFrequency_2017_2024',
+  folder: 'FloodInventory_Koshi', fileNamePrefix: 'flood_frequency',
+  region: roi, scale: 10, crs: 'EPSG:32645',
+  maxPixels: 1e13, fileFormat: 'GeoTIFF'
+});
+
+Export.table.toDrive({
+  collection: allPoints,
+  description: 'FloodSamplePoints_12000',
+  folder: 'FloodInventory_Koshi',
+  fileNamePrefix: 'flood_sample_points_12000',
+  fileFormat: 'CSV'
+});
+
+print('');
+print('Exports submitted. Tasks panel → RUN all three.');
+print('');
+print('REPORT BACK:');
+print('1. Flood points count (should be close to 6,000)');
+print('2. Non-flood points count (should be 6,000)');
+print('3. Per-event areas — verify they match earlier results');
+print('   2017≈52, 2019≈34, 2021≈69, 2022≈52, 2024≈45');
+print('4. Total merged area (should still be ~148 km²)');
